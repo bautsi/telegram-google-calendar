@@ -45,7 +45,7 @@ USER appuser
 COPY . .
 
 # Copy Google Calendar auth token to temp file
-COPY token.json /tmp/token.json
+# COPY token.json /tmp/token.json
 
 # Expose the port that the application listens on.
 EXPOSE 8080

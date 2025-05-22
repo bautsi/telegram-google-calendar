@@ -11,11 +11,11 @@ from typing import Any, List, Optional
 # import ngrok
 import requests
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from google import genai
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from pydantic import BaseModel
@@ -39,9 +39,11 @@ logging.basicConfig(
 # Global Variables
 # If modifying these scopes, delete the file token.json.
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+OAUTH_FLAG_PATH = "/tmp/oauth_waiting"
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MY_GMAIL = os.getenv("MY_GMAIL")
 
@@ -112,9 +114,7 @@ DEFAULT_EVENT_STRUCTURE = {
 }
 
 
-def event_replace(
-    gemini_json_response: dict[str, Any], copied_event: dict[str, Any]
-) -> dict[str, Any]:
+def event_replace(gemini_json_response: dict[str, Any], copied_event: dict[str, Any]) -> dict[str, Any]:
     """Replace default event after getting Gemini response
 
     Args:
@@ -154,9 +154,7 @@ def event_replace(
         for minute in gemini_json_response["reminder_minutes"]:
             # Prevent over limit popups (5)
             if len(copied_event["reminders"]["overrides"]) < 5:
-                copied_event["reminders"]["overrides"].append(
-                    {"method": "popup", "minutes": int(minute)}
-                )
+                copied_event["reminders"]["overrides"].append({"method": "popup", "minutes": int(minute)})
             else:
                 break
         logging.debug("[Event replace]: reminder added")
@@ -218,7 +216,7 @@ def set_webhook(public_url: str):
     logging.debug(f"[Webhook set response]: {response.text}")
 
 
-def send_message(chat_id: str, text: str):
+def send_message(text: str):
     """Telegram send message from server to chat room
 
     Args:
@@ -226,7 +224,7 @@ def send_message(chat_id: str, text: str):
         text (str): Message that want to let user read
     """
     url = f"{BOT_URL}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {"chat_id": CHAT_ID, "text": text}
     requests.post(url, json=payload)
 
 
@@ -247,7 +245,7 @@ def telegram_webhook():
 
         gemini_response = ask_gemini(user_text)
 
-        send_message(chat_id, add_event(gemini_response))
+        send_message(add_event(gemini_response))
 
     return {"ok": True}
 
@@ -255,6 +253,44 @@ def telegram_webhook():
 
 
 # Google Calendar
+def set_oauth_flag():
+    with open(OAUTH_FLAG_PATH, "w") as f:
+        f.write("waiting")
+
+
+def clear_oauth_flag():
+    if os.path.exists(OAUTH_FLAG_PATH):
+        os.remove(OAUTH_FLAG_PATH)
+
+
+def is_oauth_waiting():
+    return os.path.exists(OAUTH_FLAG_PATH)
+
+
+def generate_auth_url():
+    flow = Flow.from_client_secrets_file("credentials.json", scopes=SCOPES, redirect_uri=f"{CLOUD_RUN_URL}/auth/callback")
+    auth_uri, _ = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true")
+    return auth_uri
+
+
+@app.route("/auth/start")
+def auth_start():
+    url = generate_auth_url()
+    return jsonify({"auth_url": url})
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    code = request.args.get("code")
+    flow = Flow.from_client_secrets_file("credentials.json", scopes=SCOPES, redirect_uri=f"{CLOUD_RUN_URL}/auth/callback")
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    with open("/tmp/token.json", "w") as token:
+        token.write(creds.to_json())
+    clear_oauth_flag()
+    return "Authorization completed. You can return to the app."
+
+
 def add_event(replaced_response: dict[str, Any]) -> str:
     logging.debug(f"[Final event]: {replaced_response}")
 
@@ -263,32 +299,57 @@ def add_event(replaced_response: dict[str, Any]) -> str:
     # created automatically when the authorization flow completes for the first
     # time.
     if os.path.exists("/tmp/token.json"):
-        creds = Credentials.from_authorized_user_file("/tmp/token.json", SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file("/tmp/token.json", SCOPES)
+            if not creds.refresh_token:
+                logging.warning("[Google Calendar]: Token exists but no refresh_token, deleting")
+                os.remove("/tmp/token.json")
+                creds = None
+        except Exception as e:
+            logging.error(f"[Google Calendar]: Failed to parse token file - {e}")
+            os.remove("/tmp/token.json")
+            creds = None
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
-        # No need create when deploy on Cloud Run cause can't open in browser on it
-        # Create one on local root path as token.json and Dockerfile will help create one in tmp folder
-        logging.error("[Google Calendar]: Token not found")
-        # if creds and creds.expired and creds.refresh_token:
-        #     creds.refresh(Request())
-        # else:
-        #     flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-        #     creds = flow.run_local_server(port=0)
-        # # Save the credentials for the next run
+        # logging.error("[Google Calendar]: Token not found")
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                logging.error(f"[Google Calendar]: Token refresh failed - {e}")
+
+                set_oauth_flag()
+
+                auth_url = generate_auth_url()
+                send_message(f"Google Token Error, creating new token: \n{auth_url}")
+
+                while is_oauth_waiting():
+                    time.sleep(5)
+
+                creds = Credentials.from_authorized_user_file("/tmp/token.json", SCOPES)
+        else:
+            set_oauth_flag()
+
+            auth_url = generate_auth_url()
+            send_message(f"Create new token: \n{auth_url}")
+
+            while is_oauth_waiting():
+                time.sleep(5)
+
+            creds = Credentials.from_authorized_user_file("/tmp/token.json", SCOPES)
+            # flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+            # creds = flow.run_local_server(port=0)
+        # Save the credentials for the next run
         # with open("/tmp/token.json", "w") as token:
         #     token.write(creds.to_json())
 
     try:
         service = build("calendar", "v3", credentials=creds)
 
-        event = (
-            service.events()
-            .insert(calendarId="primary", body=replaced_response)
-            .execute()
-        )
+        event = service.events().insert(calendarId="primary", body=replaced_response).execute()
 
-        logging.info(f"[Google Calendar]: Event created - {event.get("htmlLink")}")
-        return f"Event created: {event.get("htmlLink")}"
+        logging.info(f"[Google Calendar]: Event created - {event.get('htmlLink')}")
+        return f"Event created: {event.get('htmlLink')}"
 
     except HttpError as error:
         logging.error(f"[Google Calendar]: An error occurred: {error}")
